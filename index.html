@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Model Viewer – Semestrálny projekt</title>
+
+  <!-- CSS -->
+  <link rel="stylesheet" href="style.css" />
+
+  <!--
+    PyScript 2024.11 – Python bežiaci priamo v prehliadači cez Pyodide (WebAssembly).
+    Žiadny server nie je potrebný – všetko prebieha client-side.
+  -->
+  <link rel="stylesheet" href="https://pyscript.net/releases/2024.11.1/core.css" />
+  <script type="module" src="https://pyscript.net/releases/2024.11.1/core.js"></script>
+</head>
+
+<body>
+
+  <!-- ============================================================
+       LOADING SCREEN  –  zobrazí sa kým sa načítava Pyodide (~2-4s)
+       ============================================================ -->
+  <div id="loading-screen">
+    <div class="loading-logo">3D·VIEW</div>
+    <div class="loading-bar"><div class="loading-bar-inner"></div></div>
+    <div class="loading-msg">Načítavam Python (Pyodide) ...</div>
+  </div>
+
+
+  <!-- ============================================================
+       HLAVNÁ APLIKÁCIA
+       ============================================================ -->
+  <div class="app-shell">
+
+    <!-- ---- HLAVIČKA ---- -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-mark">3D</div>
+        <div>
+          <div class="app-title">3D MODEL VIEWER</div>
+          <div class="app-subtitle">Python · PyScript · Canvas</div>
+        </div>
+      </div>
+      <!-- Odkaz späť na hlavný portál -->
+      <a href="/" class="back-link">← Späť</a>
+    </header>
+
+
+    <!-- ---- TOOLBAR ---- -->
+    <div class="toolbar">
+      <span class="toolbar-label">Model:</span>
+
+      <!-- Tlačidlo na výber .obj súboru – spúšťa skrytý input -->
+      <button class="btn btn-primary" onclick="document.getElementById('file-input').click()">
+        ⊕ Vybrať .obj
+      </button>
+
+      <!-- Skrytý file input – spracovanie prebieha v main.py -->
+      <input type="file" id="file-input" accept=".obj" />
+
+      <div class="toolbar-sep"></div>
+
+      <!-- Wireframe / Solid prepínač -->
+      <button class="btn" id="btn-wireframe">⬡ Wireframe</button>
+
+      <!-- Reset kamery -->
+      <button class="btn" id="btn-reset">↺ Reset</button>
+
+      <div class="toolbar-sep"></div>
+
+      <span class="toolbar-label">alebo pretiahni .obj súbor na canvas</span>
+    </div>
+
+
+    <!-- ---- PRACOVNÁ PLOCHA ---- -->
+    <div class="workspace">
+
+      <!-- Canvas sekcia -->
+      <div class="canvas-wrap" id="canvas-wrap">
+
+        <!-- Overlay pre drag & drop vizuálnu spätnú väzbu -->
+        <div class="drop-overlay">
+          <span style="font-size:28px">⊕</span>
+          Pustiť .obj súbor
+        </div>
+
+        <!--
+          Hlavný canvas – sem Python (main.py) kreslí 3D scénu.
+          Atribúty width/height sa nastavujú dynamicky v init().
+        -->
+        <canvas id="canvas3d" width="800" height="520"></canvas>
+
+        <!-- Nápoveda v rohu -->
+        <div class="canvas-hint">
+          Ľavá myš · ťahaj = rotácia<br>
+          Koliesko = zoom<br>
+          R = reset · L = wireframe
+        </div>
+      </div>
+
+      <!-- Info panel -->
+      <aside class="info-panel">
+        <div class="panel-title">// Info</div>
+
+        <div class="info-row">
+          <span class="info-key">Názov</span>
+          <span class="info-val" id="info-nazov">—</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Vertexy</span>
+          <span class="info-val" id="info-vertexy">—</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Plochy</span>
+          <span class="info-val" id="info-plochy">—</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Stav</span>
+          <span class="info-val" id="info-stav">⏳ Inicializujem…</span>
+        </div>
+
+        <!-- Ovládanie -->
+        <div class="controls-list">
+          <div class="controls-title">// Ovládanie</div>
+
+          <div class="ctrl-row">
+            <span class="ctrl-key">Ľavá myš</span>
+            <span class="ctrl-desc">Rotácia modelu</span>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-key">Koliesko</span>
+            <span class="ctrl-desc">Zoom in / out</span>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-key">R</span>
+            <span class="ctrl-desc">Reset kamery</span>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-key">L</span>
+            <span class="ctrl-desc">Wireframe / Solid</span>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-key">⊕ Vybrať</span>
+            <span class="ctrl-desc">Nahrať .obj súbor</span>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-key">Drag&amp;drop</span>
+            <span class="ctrl-desc">Pretiahni .obj na canvas</span>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+  </div><!-- /.app-shell -->
+
+
+  <!-- ============================================================
+       PYSCRIPT  –  načíta a spustí main.py priamo v prehliadači
+       type="py" znamená: "toto je Python kód / odkaz na Python kód"
+       ============================================================ -->
+  <script type="py" src="main.py" config='{"packages": []}'></script>
+
+
+  <!-- ============================================================
+       JAVASCRIPT POMOCNÍCI
+       (iba nutné minimum – hlavná logika je v main.py)
+       ============================================================ -->
+  <script>
+    // ---- Skrytie loading screenu po inicializácii PyScriptu ----
+    // PyScript vyvolá udalosť "py:ready" keď je Pyodide pripravený
+    document.addEventListener("py:ready", function () {
+      const screen = document.getElementById("loading-screen");
+      if (screen) {
+        screen.classList.add("hidden");
+      }
+    });
+
+    // ---- Drag & drop vizuálna spätná väzba (CSS trieda) ----
+    // Logiku spracovania súboru rieši main.py (on_drop)
+    const wrap = document.getElementById("canvas-wrap");
+
+    document.addEventListener("dragenter", function (e) {
+      if (e.dataTransfer && e.dataTransfer.types.includes("Files")) {
+        wrap.classList.add("drag-active");
+      }
+    });
+
+    document.addEventListener("dragleave", function (e) {
+      // dragleave sa vyvolá aj pri pohybe v rámci canvasu – overíme relatedTarget
+      if (!wrap.contains(e.relatedTarget)) {
+        wrap.classList.remove("drag-active");
+      }
+    });
+
+    document.addEventListener("drop", function () {
+      wrap.classList.remove("drag-active");
+    });
+  </script>
+
+</body>
+</html>
