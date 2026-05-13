@@ -5,26 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>3D Model Viewer – Semestrálny projekt</title>
 
-  <!-- CSS -->
   <link rel="stylesheet" href="style.css" />
 
   <!--
-    PyScript 2024.11 – Python bežiaci priamo v prehliadači cez Pyodide (WebAssembly).
-    Žiadny server nie je potrebný – všetko prebieha client-side.
+    PyScript 2024.11 – Python cez Pyodide (WebAssembly).
+    100% client-side, žiadny server nie je potrebný.
   -->
   <link rel="stylesheet" href="https://pyscript.net/releases/2024.11.1/core.css" />
-  <script type="module" src="https://pyscript.net/releases/2024.11.1/core.js"></script>
+  <script type="module"  src="https://pyscript.net/releases/2024.11.1/core.js"></script>
 </head>
 
 <body>
 
   <!-- ============================================================
-       LOADING SCREEN  –  zobrazí sa kým sa načítava Pyodide (~2-4s)
+       LOADING SCREEN  –  kým sa sťahuje Pyodide (~2–5 s)
        ============================================================ -->
   <div id="loading-screen">
     <div class="loading-logo">3D·VIEW</div>
     <div class="loading-bar"><div class="loading-bar-inner"></div></div>
-    <div class="loading-msg">Načítavam Python (Pyodide) ...</div>
+    <div class="loading-msg" id="loading-msg">Načítavam Python engine (Pyodide)…</div>
   </div>
 
 
@@ -39,37 +38,65 @@
         <div class="logo-mark">3D</div>
         <div>
           <div class="app-title">3D MODEL VIEWER</div>
-          <div class="app-subtitle">Python · PyScript · Canvas</div>
+          <div class="app-subtitle">Python · PyScript · Canvas · Blender-like controls</div>
         </div>
       </div>
-      <!-- Odkaz späť na hlavný portál -->
       <a href="/" class="back-link">← Späť</a>
     </header>
 
 
-    <!-- ---- TOOLBAR ---- -->
-    <div class="toolbar">
-      <span class="toolbar-label">Model:</span>
+    <!-- ---- TOOLBAR  (riadok 1: súbor + mód) ---- -->
+    <div class="toolbar" id="toolbar-main">
 
-      <!-- Tlačidlo na výber .obj súboru – spúšťa skrytý input -->
-      <button class="btn btn-primary" onclick="document.getElementById('file-input').click()">
-        ⊕ Vybrať .obj
+      <button class="btn btn-primary"
+              onclick="document.getElementById('file-input').click()">
+        ⊕ Otvoriť .obj
       </button>
-
-      <!-- Skrytý file input – spracovanie prebieha v main.py -->
       <input type="file" id="file-input" accept=".obj" />
 
       <div class="toolbar-sep"></div>
 
-      <!-- Wireframe / Solid prepínač -->
-      <button class="btn" id="btn-wireframe">⬡ Wireframe</button>
+      <button class="btn" id="btn-wireframe" data-active="false">
+        ⬡ Wireframe
+      </button>
 
-      <!-- Reset kamery -->
       <button class="btn" id="btn-reset">↺ Reset</button>
 
       <div class="toolbar-sep"></div>
 
-      <span class="toolbar-label">alebo pretiahni .obj súbor na canvas</span>
+      <!-- Preset pohľady (Blender numpad) -->
+      <span class="toolbar-label">Pohľad:</span>
+      <button class="btn btn-small" id="btn-view-1" title="Numpad 1 – predný">Front</button>
+      <button class="btn btn-small" id="btn-view-3" title="Numpad 3 – bočný">Side</button>
+      <button class="btn btn-small" id="btn-view-7" title="Numpad 7 – horný">Top</button>
+    </div>
+
+
+    <!-- ---- TOOLBAR  (riadok 2: materiálové farby) ---- -->
+    <div class="toolbar toolbar-materials">
+      <span class="toolbar-label">Materiál:</span>
+
+      <!--
+        data-rgb = "r,g,b" float 0–1, spracúva Python on_material_click()
+        data-active = "true" označuje vybraný materiál (CSS štýl)
+      -->
+      <button class="mat-btn" data-rgb="0.55,0.58,0.62" data-active="true"
+              style="--mc:#8fa0b0" title="Sivá"></button>
+      <button class="mat-btn" data-rgb="0.20,0.45,0.80" data-active="false"
+              style="--mc:#3370cc" title="Modrá"></button>
+      <button class="mat-btn" data-rgb="0.25,0.65,0.35" data-active="false"
+              style="--mc:#3fa558" title="Zelená"></button>
+      <button class="mat-btn" data-rgb="0.75,0.22,0.22" data-active="false"
+              style="--mc:#c03838" title="Červená"></button>
+      <button class="mat-btn" data-rgb="0.85,0.48,0.12" data-active="false"
+              style="--mc:#d87a1e" title="Oranžová"></button>
+      <button class="mat-btn" data-rgb="0.85,0.85,0.85" data-active="false"
+              style="--mc:#d9d9d9" title="Biela"></button>
+      <button class="mat-btn" data-rgb="0.15,0.17,0.20" data-active="false"
+              style="--mc:#252a33" title="Tmavá"></button>
+
+      <div class="toolbar-sep"></div>
+      <span class="toolbar-hint">alebo pretiahni .obj súbor priamo na canvas</span>
     </div>
 
 
@@ -78,122 +105,139 @@
 
       <!-- Canvas sekcia -->
       <div class="canvas-wrap" id="canvas-wrap">
-
-        <!-- Overlay pre drag & drop vizuálnu spätnú väzbu -->
         <div class="drop-overlay">
-          <span style="font-size:28px">⊕</span>
+          <span class="drop-icon">⊕</span>
           Pustiť .obj súbor
         </div>
 
         <!--
-          Hlavný canvas – sem Python (main.py) kreslí 3D scénu.
-          Atribúty width/height sa nastavujú dynamicky v init().
+          Hlavné vykresľovacie plátno.
+          Rozlíšenie sa nastavuje dynamicky v Python init().
         -->
-        <canvas id="canvas3d" width="800" height="520"></canvas>
+        <canvas id="canvas3d"></canvas>
 
         <!-- Nápoveda v rohu -->
         <div class="canvas-hint">
-          Ľavá myš · ťahaj = rotácia<br>
-          Koliesko = zoom<br>
-          R = reset · L = wireframe
+          LMB / MMB · ťahaj&nbsp;=&nbsp;orbit<br>
+          Shift+drag&nbsp;=&nbsp;pan<br>
+          Koliesko&nbsp;=&nbsp;zoom<br>
+          R&nbsp;=&nbsp;reset &nbsp;·&nbsp; L&nbsp;=&nbsp;wireframe<br>
+          1&nbsp;/&nbsp;3&nbsp;/&nbsp;7&nbsp;=&nbsp;pohľad
         </div>
       </div>
 
-      <!-- Info panel -->
+
+      <!-- ---- Pravý info + ovládanie panel ---- -->
       <aside class="info-panel">
-        <div class="panel-title">// Info</div>
 
-        <div class="info-row">
-          <span class="info-key">Názov</span>
-          <span class="info-val" id="info-nazov">—</span>
-        </div>
-        <div class="info-row">
-          <span class="info-key">Vertexy</span>
-          <span class="info-val" id="info-vertexy">—</span>
-        </div>
-        <div class="info-row">
-          <span class="info-key">Plochy</span>
-          <span class="info-val" id="info-plochy">—</span>
-        </div>
-        <div class="info-row">
-          <span class="info-key">Stav</span>
-          <span class="info-val" id="info-stav">⏳ Inicializujem…</span>
+        <!-- Štatistiky modelu -->
+        <div class="panel-section">
+          <div class="panel-title">// Model</div>
+
+          <div class="info-row">
+            <span class="info-key">Názov</span>
+            <span class="info-val" id="info-nazov">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-key">Vertexy</span>
+            <span class="info-val" id="info-vertexy">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-key">Normály</span>
+            <span class="info-val" id="info-normals">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-key">Plochy</span>
+            <span class="info-val" id="info-plochy">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-key">Stav</span>
+            <span class="info-val" id="info-stav">⏳ Inicializujem…</span>
+          </div>
         </div>
 
-        <!-- Ovládanie -->
-        <div class="controls-list">
-          <div class="controls-title">// Ovládanie</div>
+        <!-- Ovládanie – Blender-like prehľad -->
+        <div class="panel-section">
+          <div class="panel-title">// Ovládanie</div>
 
+          <div class="ctrl-group-label">Pohľad</div>
           <div class="ctrl-row">
-            <span class="ctrl-key">Ľavá myš</span>
-            <span class="ctrl-desc">Rotácia modelu</span>
+            <span class="ctrl-key">LMB drag</span>
+            <span class="ctrl-desc">Orbit – rotácia</span>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-key">MMB drag</span>
+            <span class="ctrl-desc">Orbit – rotácia</span>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-key">Shift+drag</span>
+            <span class="ctrl-desc">Pan – posun</span>
           </div>
           <div class="ctrl-row">
             <span class="ctrl-key">Koliesko</span>
             <span class="ctrl-desc">Zoom in / out</span>
           </div>
+
+          <div class="ctrl-group-label" style="margin-top:10px">Klávesy</div>
           <div class="ctrl-row">
             <span class="ctrl-key">R</span>
-            <span class="ctrl-desc">Reset kamery</span>
+            <span class="ctrl-desc">Reset pohľadu</span>
           </div>
           <div class="ctrl-row">
             <span class="ctrl-key">L</span>
             <span class="ctrl-desc">Wireframe / Solid</span>
           </div>
           <div class="ctrl-row">
-            <span class="ctrl-key">⊕ Vybrať</span>
-            <span class="ctrl-desc">Nahrať .obj súbor</span>
-          </div>
-          <div class="ctrl-row">
-            <span class="ctrl-key">Drag&amp;drop</span>
-            <span class="ctrl-desc">Pretiahni .obj na canvas</span>
+            <span class="ctrl-key">1 / 3 / 7</span>
+            <span class="ctrl-desc">Front / Side / Top</span>
           </div>
         </div>
+
       </aside>
-    </div>
+    </div><!-- /.workspace -->
 
   </div><!-- /.app-shell -->
 
 
   <!-- ============================================================
-       PYSCRIPT  –  načíta a spustí main.py priamo v prehliadači
-       type="py" znamená: "toto je Python kód / odkaz na Python kód"
+       PYSCRIPT  –  načíta a spustí main.py v prehliadači
        ============================================================ -->
   <script type="py" src="main.py" config='{"packages": []}'></script>
 
 
   <!-- ============================================================
-       JAVASCRIPT POMOCNÍCI
-       (iba nutné minimum – hlavná logika je v main.py)
+       MINIMAL JS  –  iba loading screen + drag CSS feedback
+       (všetka logika je v main.py)
        ============================================================ -->
   <script>
-    // ---- Skrytie loading screenu po inicializácii PyScriptu ----
-    // PyScript vyvolá udalosť "py:ready" keď je Pyodide pripravený
+    // Skryť loading screen keď je Pyodide pripravený
     document.addEventListener("py:ready", function () {
-      const screen = document.getElementById("loading-screen");
-      if (screen) {
-        screen.classList.add("hidden");
-      }
+      const s = document.getElementById("loading-screen");
+      if (s) s.classList.add("hidden");
     });
 
-    // ---- Drag & drop vizuálna spätná väzba (CSS trieda) ----
-    // Logiku spracovania súboru rieši main.py (on_drop)
+    // Aktualizovať loading správu počas sťahovania
+    document.addEventListener("py:progress", function (e) {
+      const el = document.getElementById("loading-msg");
+      if (el && e.detail) el.textContent = e.detail;
+    });
+
+    // Drag & drop vizuálna spätná väzba (CSS trieda na wrap elemente)
     const wrap = document.getElementById("canvas-wrap");
+    let dragDepth = 0;
 
     document.addEventListener("dragenter", function (e) {
       if (e.dataTransfer && e.dataTransfer.types.includes("Files")) {
+        dragDepth++;
         wrap.classList.add("drag-active");
       }
     });
-
-    document.addEventListener("dragleave", function (e) {
-      // dragleave sa vyvolá aj pri pohybe v rámci canvasu – overíme relatedTarget
-      if (!wrap.contains(e.relatedTarget)) {
-        wrap.classList.remove("drag-active");
-      }
+    document.addEventListener("dragleave", function () {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) wrap.classList.remove("drag-active");
     });
-
     document.addEventListener("drop", function () {
+      dragDepth = 0;
       wrap.classList.remove("drag-active");
     });
   </script>

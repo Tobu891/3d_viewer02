@@ -1,193 +1,289 @@
 # ================================================================
-#  main.py  –  3D Model Viewer  (PyScript / Pyodide)
-#  Beží priamo v prehliadači, žiadny server nie je potrebný.
+#  main.py  –  3D Model Viewer v2  (PyScript / Pyodide)
+#  100% client-side, beží priamo v prehliadači bez servera.
 #
-#  Čo tento súbor robí:
-#    - parsuje .obj súbor (vertexy, normály, plochy)
-#    - implementuje jednoduchú 3D → 2D projekciu (perspektíva)
-#    - vykresľuje wireframe aj základný „flat-shaded" solid mód
-#    - reaguje na myš (rotácia, zoom) a klávesy (R, L)
-#    - komunikuje s HTML canvasom cez JavaScript bridge
+#  Novinky v tejto verzii:
+#    - Spracovanie normál z OBJ (vn) + dopočítanie ak chýbajú
+#    - Lambert flat shading bez viditeľných hrán v solid móde
+#    - Blender-like ovládanie: MMB orbit, Shift+MMB pan, koliesko zoom
+#    - Záložné ovládanie: LMB orbit, Shift+LMB pan
+#    - Pan posúva kamerový offset (nie model)
+#    - Výber farby / materiálu modelu
+#    - Numpad skratky: 1=front, 3=side, 7=top
+#    - Painter's algorithm pre správne poradie plôch
 # ================================================================
 
 import math
-import json
-from pyodide.ffi import create_proxy   # Proxy pre JS event listenery
-from js import document, window, console, Object  # JS globály
+from pyodide.ffi import create_proxy
+from js import document, window, console, Object
 
 
 # ================================================================
-#  GLOBÁLNY STAV APLIKÁCIE
+#  GLOBÁLNY STAV MODELU
 # ================================================================
 
-# Aktuálny 3D model uložený ako slovník
-stav = {
-    "vertexy":  [],          # zoznam (x, y, z) – surové 3D body
-    "plochy":   [],          # zoznam zoznamov indexov vertexov
-    "nazov":    "demo_kocka",
-    "nacitany": False,
+model = {
+    "vertexy":      [],   # list of (x,y,z)  – pozície vertexov
+    "normals_obj":  [],   # list of (nx,ny,nz) – normály z OBJ (vn riadky)
+    "plochy":       [],   # list of { "vi": [...], "ni": [...] }
+                          #   vi = indexy vertexov (0-based)
+                          #   ni = indexy normál  (0-based), môže byť []
+    "face_normals": [],   # dopočítané face-normály (1 na plochu)
+    "ma_obj_normals": False,  # či OBJ obsahoval vn záznamy
+    "nazov":        "demo_kocka",
+    "nacitany":     False,
 }
 
-# Stav kamery / pohľadu
+# ================================================================
+#  STAV KAMERY / POHĽADU
+# ================================================================
+
 kamera = {
-    "rot_x":    0.25,        # Rotácia okolo osi X (radiány)
-    "rot_y":    0.45,        # Rotácia okolo osi Y (radiány)
-    "zoom":     1.0,         # Faktor priblíženia
-    "wireframe": True,       # True = drôtový mód, False = solid
+    "rot_x":    0.4,      # pitch – rotácia okolo X (radiány)
+    "rot_y":    0.6,      # yaw   – rotácia okolo Y (radiány)
+    "zoom":     1.0,      # faktor priblíženia
+    "pan_x":    0.0,      # posun pohľadu – X (world jednotky)
+    "pan_y":    0.0,      # posun pohľadu – Y (world jednotky)
+    "wireframe": False,   # False = solid, True = wireframe
+    "material": (0.55, 0.65, 0.75),  # základná RGB farba modelu (0–1)
 }
 
-# Stav ťahania myši
+# Predvolené pohľady (Blender numpad)
+POHLADOVE_PRESET = {
+    "1": (0.0,   0.0,   "predný"),
+    "3": (0.0,   math.pi / 2, "bočný"),
+    "7": (-math.pi / 2, 0.0, "horný"),
+}
+
+# Dostupné materiálové farby
+MATERIALY = {
+    "siva":    (0.55, 0.58, 0.62),
+    "modra":   (0.20, 0.45, 0.80),
+    "zelena":  (0.25, 0.65, 0.35),
+    "cervena": (0.75, 0.22, 0.22),
+    "oranzova":(0.85, 0.48, 0.12),
+    "biela":   (0.85, 0.85, 0.85),
+    "tmava":   (0.15, 0.17, 0.20),
+}
+
+# ================================================================
+#  STAV MYŠI
+# ================================================================
+
 mys = {
-    "tahanie":  False,
-    "posl_x":   0,
-    "posl_y":   0,
+    "tahanie_orbit": False,   # LMB alebo MMB bez Shift
+    "tahanie_pan":   False,   # Shift + LMB alebo Shift + MMB
+    "posl_x": 0,
+    "posl_y": 0,
 }
 
 
 # ================================================================
-#  DEMO MODEL  –  kocka (fallback keď nie je nahratý .obj)
+#  DEMO MODEL  –  kocka s explicitnými normálami
 # ================================================================
-
-DEMO_VERTEXY = [
-    (-1, -1, -1), ( 1, -1, -1), ( 1,  1, -1), (-1,  1, -1),  # zadná stena
-    (-1, -1,  1), ( 1, -1,  1), ( 1,  1,  1), (-1,  1,  1),  # predná stena
-]
-
-DEMO_PLOCHY = [
-    [0, 1, 2, 3],   # zadná
-    [4, 5, 6, 7],   # predná
-    [0, 1, 5, 4],   # spodná
-    [2, 3, 7, 6],   # horná
-    [0, 3, 7, 4],   # ľavá
-    [1, 2, 6, 5],   # pravá
-]
-
 
 def nacitaj_demo():
-    """Naplní globálny stav demo kockou."""
-    stav["vertexy"]  = list(DEMO_VERTEXY)
-    stav["plochy"]   = list(DEMO_PLOCHY)
-    stav["nazov"]    = "demo_kocka"
-    stav["nacitany"] = True
+    """Naplní stav demo kockou (8 vertexov, 6 plôch, 6 normál)."""
+    vertexy = [
+        (-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),
+        (-1,-1, 1),(1,-1, 1),(1,1, 1),(-1,1, 1),
+    ]
+    # Outward-facing normály pre každú stenu kocky
+    normals_obj = [
+        (0,0,-1),(0,0,1),(0,-1,0),(0,1,0),(-1,0,0),(1,0,0),
+    ]
+    # Každá plocha odkazuje na 4 vertexy a 1 normálu (flat per-face)
+    plochy = [
+        {"vi":[0,3,2,1], "ni":[0,0,0,0]},   # zadná  (-Z)
+        {"vi":[4,5,6,7], "ni":[1,1,1,1]},   # predná (+Z)
+        {"vi":[0,1,5,4], "ni":[2,2,2,2]},   # spodná (-Y)
+        {"vi":[2,3,7,6], "ni":[3,3,3,3]},   # horná  (+Y)
+        {"vi":[0,4,7,3], "ni":[4,4,4,4]},   # ľavá   (-X)
+        {"vi":[1,2,6,5], "ni":[5,5,5,5]},   # pravá  (+X)
+    ]
+
+    model["vertexy"]      = vertexy
+    model["normals_obj"]  = normals_obj
+    model["plochy"]       = plochy
+    model["ma_obj_normals"] = True
+    model["nazov"]        = "demo_kocka"
+    model["nacitany"]     = True
+
+    vypocitaj_face_normals()
     aktualizuj_info_panel()
     vykresli()
 
 
 # ================================================================
-#  PARSER .OBJ SÚBOROV
+#  PARSER OBJ
 # ================================================================
 
 def parsuj_obj(obsah: str, nazov: str = "model"):
     """
-    Parsuje textový obsah .obj súboru.
+    Parsuje .obj súbor. Spracúva:
+      v  x y z         – vertex
+      vn nx ny nz       – normála vrcholu
+      f  v/t/n  ...     – plocha (podporuje v, v/t, v//n, v/t/n)
 
-    Spracúva:
-      v  x y z       → vertex (bod v priestore)
-      f  i j k ...   → plocha (trojuholník alebo polygón)
-                        Indexy môžu byť vo formáte  i  alebo  i/t  alebo  i/t/n
-
-    Ignoruje: normály (vn), UV súradnice (vt), materiály, komentáre.
-
-    Args:
-        obsah:  Celý textový obsah .obj súboru.
-        nazov:  Meno súboru (zobrazené v info paneli).
-
-    Returns:
-        True ak parsovanie prebehlo bez chyby, inak False.
+    Normály z OBJ sa preferujú pred dopočítanými.
+    Ak OBJ normály neobsahuje, dopočítajú sa face-normály.
     """
-    nove_vertexy = []
-    nove_plochy  = []
+    nove_vertexy     = []
+    nove_normals_obj = []
+    nove_plochy      = []
 
-    for cislo_riadku, riadok in enumerate(obsah.splitlines(), 1):
+    for r_idx, riadok in enumerate(obsah.splitlines(), 1):
         riadok = riadok.strip()
-
-        # Preskočiť prázdne riadky a komentáre
         if not riadok or riadok.startswith("#"):
             continue
 
         casti = riadok.split()
         typ   = casti[0].lower()
 
-        # ---- Vertex ----
+        # ---- Vertex (v) ----
         if typ == "v" and len(casti) >= 4:
             try:
-                x, y, z = float(casti[1]), float(casti[2]), float(casti[3])
-                nove_vertexy.append((x, y, z))
+                nove_vertexy.append((
+                    float(casti[1]),
+                    float(casti[2]),
+                    float(casti[3]),
+                ))
             except ValueError:
-                console.warn(f"[OBJ] Riadok {cislo_riadku}: chybný vertex '{riadok}'")
+                console.warn(f"[OBJ] r.{r_idx}: chybný vertex")
 
-        # ---- Plocha ----
+        # ---- Normála (vn) ----
+        elif typ == "vn" and len(casti) >= 4:
+            try:
+                nove_normals_obj.append((
+                    float(casti[1]),
+                    float(casti[2]),
+                    float(casti[3]),
+                ))
+            except ValueError:
+                console.warn(f"[OBJ] r.{r_idx}: chybná normála")
+
+        # ---- Plocha (f) ----
         elif typ == "f" and len(casti) >= 4:
-            indexy = []
-            chyba  = False
+            vi_list = []
+            ni_list = []
+            chyba   = False
+
             for token in casti[1:]:
-                # Token môže byť  "1"  alebo  "1/2"  alebo  "1/2/3"
+                # Token formáty: "1"  "1/2"  "1//3"  "1/2/3"
+                casti_tok = token.split("/")
                 try:
-                    idx = int(token.split("/")[0])
-                    # .obj indexuje od 1, Python od 0
-                    idx = idx - 1 if idx > 0 else len(nove_vertexy) + idx
-                    indexy.append(idx)
+                    raw_v = int(casti_tok[0])
+                    idx_v = raw_v - 1 if raw_v > 0 else len(nove_vertexy) + raw_v
+                    vi_list.append(idx_v)
                 except ValueError:
-                    console.warn(f"[OBJ] Riadok {cislo_riadku}: chybný index '{token}'")
                     chyba = True
                     break
-            if not chyba and len(indexy) >= 3:
-                nove_plochy.append(indexy)
+
+                # Normálový index (3. pozícia tokenu, môže chýbať)
+                idx_n = None
+                if len(casti_tok) >= 3 and casti_tok[2]:
+                    try:
+                        raw_n = int(casti_tok[2])
+                        idx_n = raw_n - 1 if raw_n > 0 else len(nove_normals_obj) + raw_n
+                    except ValueError:
+                        pass
+                ni_list.append(idx_n)
+
+            if not chyba and len(vi_list) >= 3:
+                # Ak niektorý n-index je None, zrušíme celý ni_list pre túto plochu
+                has_all_n = all(n is not None for n in ni_list)
+                nove_plochy.append({
+                    "vi": vi_list,
+                    "ni": ni_list if has_all_n else [],
+                })
 
     if not nove_vertexy:
-        zobraz_chybu("Súbor neobsahuje žiadne vertexy (v x y z).")
+        zobraz_chybu("Súbor neobsahuje vertexy (v x y z).")
         return False
-
     if not nove_plochy:
-        zobraz_chybu("Súbor neobsahuje žiadne plochy (f i j k).")
+        zobraz_chybu("Súbor neobsahuje plochy (f ...).")
         return False
 
-    # Uložiť do globálneho stavu
-    stav["vertexy"]  = nove_vertexy
-    stav["plochy"]   = nove_plochy
-    stav["nazov"]    = nazov.replace(".obj", "")
-    stav["nacitany"] = True
+    model["vertexy"]       = nove_vertexy
+    model["normals_obj"]   = nove_normals_obj
+    model["plochy"]        = nove_plochy
+    model["ma_obj_normals"]= bool(nove_normals_obj)
+    model["nazov"]         = nazov.replace(".obj","")
+    model["nacitany"]      = True
 
-    # Automaticky vycentrovať a normalizovať veľkosť modelu
     normalizuj_model()
+    vypocitaj_face_normals()
     aktualizuj_info_panel()
     vykresli()
     return True
 
 
+# ================================================================
+#  NORMALIZÁCIA  –  centrovanie + škálovanie
+# ================================================================
+
 def normalizuj_model():
-    """
-    Vycentruje model do počiatku súradníc a škáluje ho
-    tak, aby sa zmestil do kocky s rozmerom 2×2×2.
-    Zabezpečuje, že rôzne modely budú mať podobnú veľkosť na obrazovke.
-    """
-    if not stav["vertexy"]:
+    """Vycentruje model a škáluje ho do jednotkovej gule (polomer ≈ 1)."""
+    verts = model["vertexy"]
+    if not verts:
         return
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    zs = [v[2] for v in verts]
+    cx = (min(xs)+max(xs))/2
+    cy = (min(ys)+max(ys))/2
+    cz = (min(zs)+max(zs))/2
+    r  = max(max(xs)-min(xs), max(ys)-min(ys), max(zs)-min(zs)) / 2
+    if r == 0:
+        r = 1
+    model["vertexy"] = [((x-cx)/r, (y-cy)/r, (z-cz)/r) for x,y,z in verts]
 
-    xs = [v[0] for v in stav["vertexy"]]
-    ys = [v[1] for v in stav["vertexy"]]
-    zs = [v[2] for v in stav["vertexy"]]
 
-    # Stred ohraničujúcej krabice (bounding box)
-    cx = (min(xs) + max(xs)) / 2
-    cy = (min(ys) + max(ys)) / 2
-    cz = (min(zs) + max(zs)) / 2
+# ================================================================
+#  VÝPOČET FACE-NORMÁL  (fallback alebo vždy pre painter sorting)
+# ================================================================
 
-    # Polomer ohraničujúcej gule
-    polomer = max(
-        max(xs) - min(xs),
-        max(ys) - min(ys),
-        max(zs) - min(zs),
-    ) / 2
+def _cross(a, b):
+    """Krížový súčin dvoch 3D vektorov."""
+    return (
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0],
+    )
 
-    if polomer == 0:
-        polomer = 1
+def _normalize(v):
+    """Normalizuje 3D vektor na jednotkovú dĺžku."""
+    d = math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+    if d < 1e-10:
+        return (0.0, 0.0, 1.0)
+    return (v[0]/d, v[1]/d, v[2]/d)
 
-    # Aplikovať posun a škálovanie
-    stav["vertexy"] = [
-        ((x - cx) / polomer, (y - cy) / polomer, (z - cz) / polomer)
-        for x, y, z in stav["vertexy"]
-    ]
+def _dot(a, b):
+    """Skalárny súčin dvoch 3D vektorov."""
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+def vypocitaj_face_normals():
+    """
+    Pre každú plochu vypočíta face-normálu z prvých troch vertexov
+    pomocou krížového súčinu. Výsledok uloží do model["face_normals"].
+
+    Tieto normály sa používajú:
+      a) pre flat shading ak OBJ nemá vn záznamy
+      b) vždy pre painter's algorithm (z-sorting)
+    """
+    verts = model["vertexy"]
+    fn    = []
+    for pl in model["plochy"]:
+        vi = pl["vi"]
+        if len(vi) < 3:
+            fn.append((0,0,1))
+            continue
+        # Dva hrany od prvého vertexu
+        v0,v1,v2 = verts[vi[0]], verts[vi[1]], verts[vi[2]]
+        e1 = (v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2])
+        e2 = (v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2])
+        fn.append(_normalize(_cross(e1, e2)))
+    model["face_normals"] = fn
 
 
 # ================================================================
@@ -196,213 +292,226 @@ def normalizuj_model():
 
 def rotuj_bod(x, y, z, rx, ry):
     """
-    Aplikuje dve rotácie na bod (x, y, z):
-      rx  = rotácia okolo osi X (pitch – naklonenie hore/dole)
-      ry  = rotácia okolo osi Y (yaw   – otočenie doľava/doprava)
-
-    Vzorce pochádzajú z rotačných matíc:
-      Rx = [[1,0,0],[0,cos,-sin],[0,sin,cos]]
-      Ry = [[cos,0,sin],[0,1,0],[-sin,0,cos]]
-
-    Returns:
-        Trojica (x', y', z') po rotácii.
+    Aplikuje rotáciu okolo osi X (pitch) a potom Y (yaw).
+    Poradie: najprv X, potom Y – rovnaké ako Blender orbit.
     """
     # Rotácia okolo X
-    cos_x, sin_x = math.cos(rx), math.sin(rx)
-    y1 =  y * cos_x - z * sin_x
-    z1 =  y * sin_x + z * cos_x
-
+    cx, sx = math.cos(rx), math.sin(rx)
+    y1 =  y*cx - z*sx
+    z1 =  y*sx + z*cx
     # Rotácia okolo Y
-    cos_y, sin_y = math.cos(ry), math.sin(ry)
-    x2 =  x * cos_y + z1 * sin_y
-    z2 = -x * sin_y + z1 * cos_y
+    cy, sy = math.cos(ry), math.sin(ry)
+    x2 =  x*cy + z1*sy
+    z2 = -x*sy + z1*cy
+    return (x2, y1, z2)
 
-    return x2, y1, z2
+
+def rotuj_normal(nx, ny, nz, rx, ry):
+    """Otočí normálový vektor rovnakou rotáciou ako body scény."""
+    return rotuj_bod(nx, ny, nz, rx, ry)
 
 
-def perspektivna_projekcia(x, y, z, sirka, vyska, zoom):
+def projektuj(x, y, z, W, H, zoom, pan_x, pan_y):
     """
-    Premení 3D bod na 2D súradnice obrazovky pomocou
-    perspektívnej projekcie.
+    Perspektívna projekcia 3D bodu na 2D canvas.
 
-    Vzorec:
-        px = cx + (x / (z + d)) * f
-        py = cy - (y / (z + d)) * f   (Y je invertované – canvas má Y nadol)
+    pan_x, pan_y posúvajú výsledok v obrazovkových pixeloch
+    (aplikované po projekcii – zodpovedá Blender pan správaniu).
 
-    kde:
-        d  = vzdalenosť kamery od scény (perspektívna hĺbka)
-        f  = ohnisková vzdialenosť × zoom
-        cx, cy = stred canvasu
-
-    Returns:
-        Dvojica (px, py) – súradnice pixelu na canvase.
-        None ak je bod za kamerou (z + d <= 0).
+    Returns (px, py) alebo None ak je bod za kamerou.
     """
-    d = 3.0           # Vzdialenosť kamery
-    f = 400 * zoom    # Ohnisková vzdialenosť (zoom škáluje)
+    d = 3.5           # vzdialenosť kamery
+    f = 380 * zoom    # ohnisková vzdialenosť
 
-    menovatel = z + d
-    if menovatel <= 0.01:
-        return None   # Bod je za kamerou → preskočiť
+    men = z + d
+    if men < 0.01:
+        return None
 
-    px = sirka  / 2 + (x / menovatel) * f
-    py = vyska  / 2 - (y / menovatel) * f   # Invertujeme Y
-    return px, py
+    px = W/2 + (x / men) * f + pan_x
+    py = H/2 - (y / men) * f + pan_y
+    return (px, py)
 
 
-def vypocitaj_normal_plochy(body_3d):
+# ================================================================
+#  SVETLO  –  smer a výpočet intenzity
+# ================================================================
+
+# Smer svetla vo world-space (fixný, prichádza zľava-zhora-spredu)
+# Normalizovaný vektor
+_SVETLO_DIR = _normalize((0.6, 0.9, 1.0))
+
+# Ambientná zložka (minimálne osvetlenie aj tienených plôch)
+_AMBIENT = 0.18
+
+def lambert_intenzita(normal_ws):
     """
-    Vypočíta normálový vektor plochy pomocou krížového súčinu
-    (cross product) dvoch hrán plochy.
+    Vypočíta Lambert difúznu intenzitu pre danú normálu vo world-space.
 
-    Normála určuje, ktorým smerom plocha „mieri" –
-    používa sa pre back-face culling a tienenie.
+    Lambert model: I = max(0, dot(N, L)) + ambient
+    Výsledok je clampovaný do [0, 1].
 
     Args:
-        body_3d: Zoznam aspoň 3 trojíc (x, y, z).
-
+        normal_ws: Normalizovaná normála vo world-space (tuple 3).
     Returns:
-        Trojica (nx, ny, nz) – normálový vektor (môže byť nenormalizovaný).
+        Float v rozsahu [0, 1].
     """
-    if len(body_3d) < 3:
-        return (0, 0, 1)
+    difuz = max(0.0, _dot(normal_ws, _SVETLO_DIR))
+    return min(1.0, _AMBIENT + difuz * (1.0 - _AMBIENT))
 
-    ax, ay, az = body_3d[1][0]-body_3d[0][0], body_3d[1][1]-body_3d[0][1], body_3d[1][2]-body_3d[0][2]
-    bx, by, bz = body_3d[2][0]-body_3d[0][0], body_3d[2][1]-body_3d[0][1], body_3d[2][2]-body_3d[0][2]
 
-    nx = ay*bz - az*by
-    ny = az*bx - ax*bz
-    nz = ax*by - ay*bx
-    return (nx, ny, nz)
+def farba_plochy(intenzita, material_rgb):
+    """
+    Skonvertuje intenzitu osvetlenia a základnú farbu materiálu
+    na CSS rgb() reťazec.
+
+    Args:
+        intenzita:   Float 0–1 z lambert_intenzita()
+        material_rgb: Trojica (r,g,b) v rozsahu 0–1
+    Returns:
+        CSS string napr. "rgb(120,145,180)"
+    """
+    r, g, b = material_rgb
+    ri = int(r * intenzita * 255)
+    gi = int(g * intenzita * 255)
+    bi = int(b * intenzita * 255)
+    return f"rgb({ri},{gi},{bi})"
 
 
 # ================================================================
-#  VYKRESĽOVANIE  –  canvas
+#  VYKRESĽOVANIE
 # ================================================================
-
-def ziskaj_canvas_a_kontext():
-    """Vráti canvas element a jeho 2D kontext."""
-    canvas = document.getElementById("canvas3d")
-    ctx    = canvas.getContext("2d")
-    return canvas, ctx
-
 
 def vykresli():
     """
     Hlavná vykresľovacia funkcia.
-    Volá sa pri každej zmene stavu (rotácia, zoom, nový model).
 
     Algoritmus:
-      1. Vymaže canvas
-      2. Pre každý vertex aplikuje rotáciu + projekciu
-      3. Zoradie plochy podľa hĺbky (painter's algorithm)
-      4. Vykreslí každú plochu (wireframe alebo solid)
+      1. Transformuj všetky vertexy (rotácia + pan + projekcia)
+      2. Pre každú plochu:
+         a) Získaj normálu (z OBJ alebo dopočítanú)
+         b) Otočí normálu rovnakou rotáciou ako model
+         c) Back-face culling: preskočiť plochy odvrátené od kamery
+            (nz_view > 0 znamená, že plocha mieri preč od diváka)
+         d) Vypočítaj z-hĺbku plochy (priemerné z po rotácii)
+      3. Zoradiť plochy podľa z-hĺbky (painter's algorithm)
+      4. Vykresliť každú plochu (solid: fill bez stroke, wireframe: stroke)
     """
-    canvas, ctx = ziskaj_canvas_a_kontext()
-    W = canvas.width
-    H = canvas.height
+    canvas = document.getElementById("canvas3d")
+    ctx    = canvas.getContext("2d")
+    W, H   = canvas.width, canvas.height
 
-    # Vymazať canvas
     ctx.clearRect(0, 0, W, H)
 
-    if not stav["vertexy"]:
+    verts = model["vertexy"]
+    plochy = model["plochy"]
+    if not verts or not plochy:
         return
 
     rx   = kamera["rot_x"]
     ry   = kamera["rot_y"]
     zoom = kamera["zoom"]
+    px_o = kamera["pan_x"]
+    py_o = kamera["pan_y"]
     wire = kamera["wireframe"]
+    mat  = kamera["material"]
 
-    # ---- Krok 1: Pretransformovať všetky vertexy ----
-    # Každý vertex rotujeme a premietame do 2D
-    body_3d_rotovane = []   # Po rotácii (stále 3D – potrebné pre hĺbku a normály)
-    body_2d          = []   # Po projekcii (2D pixely)
+    # ---- Krok 1: Transformácia vertexov ----
+    # Každý vertex: rotácia → uloženie 3D (pre z-sort) → projekcia do 2D
+    verts_rot = []   # Rotované 3D body (pre z-sort a back-face culling)
+    verts_2d  = []   # Premietnuté 2D body (px, py) alebo None
 
-    for (x, y, z) in stav["vertexy"]:
+    for (x,y,z) in verts:
         rx3, ry3, rz3 = rotuj_bod(x, y, z, rx, ry)
-        body_3d_rotovane.append((rx3, ry3, rz3))
-        proj = perspektivna_projekcia(rx3, ry3, rz3, W, H, zoom)
-        body_2d.append(proj)
+        verts_rot.append((rx3, ry3, rz3))
+        verts_2d.append(projektuj(rx3, ry3, rz3, W, H, zoom, px_o, py_o))
 
-    # ---- Krok 2: Zoradiť plochy podľa priemernej Z hĺbky ----
-    # Painter's algorithm: kreslíme od najvzdialenejšieho k najbližšiemu
-    plochy_s_hlbkou = []
-    for plocha in stav["plochy"]:
-        # Filtrujeme indexy mimo rozsah (opatrnosť pri neplatných .obj)
-        platne = [i for i in plocha if 0 <= i < len(body_3d_rotovane)]
-        if len(platne) < 3:
+    # ---- Krok 2: Príprava plôch – normála, hĺbka, culling ----
+    plochy_na_kreslenie = []   # [(hlbka, plocha_dict, intenzita)]
+
+    for i, pl in enumerate(plochy):
+        vi = pl["vi"]
+        ni = pl["ni"]
+
+        # Preskočiť plochy s neplatnými vertexami
+        if any(idx < 0 or idx >= len(verts_rot) for idx in vi):
             continue
 
-        priem_z = sum(body_3d_rotovane[i][2] for i in platne) / len(platne)
-        plochy_s_hlbkou.append((priem_z, platne))
+        # -- Získať normálu pre tienenie --
+        # Priorita: per-vertex normály z OBJ → per-face dopočítaná normála
+        if ni and model["normals_obj"]:
+            # Použijeme priemernú normálu z OBJ normál plochy
+            # (pre flat shading stačí prvá, pre smooth by sme priemernili)
+            sum_n = [0.0, 0.0, 0.0]
+            valid_n = 0
+            for nidx in ni:
+                if 0 <= nidx < len(model["normals_obj"]):
+                    nn = model["normals_obj"][nidx]
+                    sum_n[0] += nn[0]
+                    sum_n[1] += nn[1]
+                    sum_n[2] += nn[2]
+                    valid_n  += 1
+            if valid_n > 0:
+                norm_ws = _normalize((sum_n[0]/valid_n, sum_n[1]/valid_n, sum_n[2]/valid_n))
+            else:
+                norm_ws = model["face_normals"][i]
+        else:
+            # Fallback: dopočítaná face-normála
+            norm_ws = model["face_normals"][i]
 
-    # Zoradiť od najvzdialenejšej (najväčší Z) k najbližšej
-    plochy_s_hlbkou.sort(key=lambda p: p[0], reverse=True)
+        # -- Otočiť normálu do view-space (rovnaká rotácia ako model) --
+        norm_view = rotuj_normal(norm_ws[0], norm_ws[1], norm_ws[2], rx, ry)
 
-    # ---- Krok 3: Vykresliť každú plochu ----
-    for (priem_z, platne) in plochy_s_hlbkou:
-
-        # Premietnuté 2D body plochy
-        pts_2d = [body_2d[i] for i in platne]
-
-        # Preskočiť ak je ktorýkoľvek bod za kamerou
-        if any(p is None for p in pts_2d):
+        # -- Back-face culling --
+        # V nášej projekcii kamera pozerá v smere -Z (do obrazovky).
+        # Ak nz_view > 0, normála mieri k divákovi → plocha je viditeľná.
+        # Ak nz_view <= 0, plocha je odvrátená → preskočíme ju.
+        # POZNÁMKA: Znamienko závisí od orientácie normál.
+        # Blender exportuje normály smerom VON z povrchu.
+        nz_view = norm_view[2]
+        if not wire and nz_view >= 0:
+            # Solid mód: culling zapnutý
             continue
+
+        # -- Priemerná Z hĺbka plochy (pre painter's algorithm) --
+        hlbka = sum(verts_rot[idx][2] for idx in vi) / len(vi)
+
+        # -- Intenzita osvetlenia (len pre solid mód) --
+        if not wire:
+            intenz = lambert_intenzita(norm_view)
+        else:
+            intenz = 1.0
+
+        plochy_na_kreslenie.append((hlbka, pl, intenz))
+
+    # ---- Krok 3: Painter's algorithm – od najvzdialenejšej ----
+    # Plochy s väčším Z sú vzdialenejšie (kamera je na kladnom konci Z)
+    plochy_na_kreslenie.sort(key=lambda t: t[0], reverse=True)
+
+    # ---- Krok 4: Kreslenie ----
+    for (hlbka, pl, intenz) in plochy_na_kreslenie:
+        vi = pl["vi"]
+        pts = [verts_2d[idx] for idx in vi]
+
+        # Preskočiť ak je niektorý bod za kamerou (None)
+        if any(p is None for p in pts):
+            continue
+
+        ctx.beginPath()
+        ctx.moveTo(pts[0][0], pts[0][1])
+        for pt in pts[1:]:
+            ctx.lineTo(pt[0], pt[1])
+        ctx.closePath()
 
         if wire:
-            # ---- WIREFRAME MÓD ----
-            ctx.beginPath()
-            ctx.moveTo(pts_2d[0][0], pts_2d[0][1])
-            for pt in pts_2d[1:]:
-                ctx.lineTo(pt[0], pt[1])
-            ctx.closePath()
-            ctx.strokeStyle = "#00e5ff"   # Tyrkysová farba hrán
-            ctx.lineWidth   = 0.8
+            # ---- WIREFRAME: iba hrany, žiadna výplň ----
+            ctx.strokeStyle = "#00e5ff"
+            ctx.lineWidth   = 0.9
             ctx.stroke()
-
         else:
-            # ---- SOLID MÓD s jednoduchým flat-shaded tienením ----
-
-            # Výpočet normály plochy (po rotácii)
-            body_plochy_3d = [body_3d_rotovane[i] for i in platne]
-            nx, ny, nz = vypocitaj_normal_plochy(body_plochy_3d)
-
-            # Normalizácia normálového vektora
-            dlzka = math.sqrt(nx*nx + ny*ny + nz*nz)
-            if dlzka > 0:
-                nx, ny, nz = nx/dlzka, ny/dlzka, nz/dlzka
-
-            # Smer svetla (svetlo prichádza zľava-zhora-spredu)
-            lx, ly, lz = 0.5, 0.8, 1.0
-            ll = math.sqrt(lx*lx + ly*ly + lz*lz)
-            lx, ly, lz = lx/ll, ly/ll, lz/ll
-
-            # Difúzne tienenie: dot product normály a smeru svetla
-            # Clampujeme na [0.1, 1.0] aby tienené časti neboli úplne čierne
-            intenzita = max(0.1, min(1.0, nx*lx + ny*ly + nz*lz))
-
-            # Back-face culling: ak Z normály mieri od kamery, preskočiť
-            # (plocha nie je viditeľná)
-            if nz > 0:
-                continue
-
-            # Farba plochy: modrasto-sivá so simulovaným tienením
-            r = int(40  + intenzita * 60)
-            g = int(80  + intenzita * 100)
-            b = int(120 + intenzita * 100)
-
-            ctx.beginPath()
-            ctx.moveTo(pts_2d[0][0], pts_2d[0][1])
-            for pt in pts_2d[1:]:
-                ctx.lineTo(pt[0], pt[1])
-            ctx.closePath()
-            ctx.fillStyle   = f"rgb({r},{g},{b})"
+            # ---- SOLID: výplň + žiadne viditeľné hrany ----
+            ctx.fillStyle = farba_plochy(intenz, mat)
             ctx.fill()
-
-            # Hrany aj v solid móde (tenšie)
-            ctx.strokeStyle = "rgba(0,229,255,0.25)"
-            ctx.lineWidth   = 0.4
-            ctx.stroke()
+            # ŽIADNY stroke → žiadne viditeľné polygonové čiary
 
 
 # ================================================================
@@ -410,238 +519,315 @@ def vykresli():
 # ================================================================
 
 def aktualizuj_info_panel():
-    """Aktualizuje HTML elementy info panela na základe aktuálneho stavu."""
-    document.getElementById("info-nazov").textContent   = stav["nazov"]
-    document.getElementById("info-vertexy").textContent = str(len(stav["vertexy"]))
-    document.getElementById("info-plochy").textContent  = str(len(stav["plochy"]))
-    document.getElementById("info-stav").textContent    = "✓ Načítaný" if stav["nacitany"] else "— Čakám na model"
-    styl = document.getElementById("info-stav").style
-    styl.color = "#00e5ff" if stav["nacitany"] else "#888"
+    """Aktualizuje všetky zobrazené štatistiky modelu v HTML paneli."""
+    def set_text(eid, txt):
+        el = document.getElementById(eid)
+        if el:
+            el.textContent = txt
+
+    set_text("info-nazov",   model["nazov"])
+    set_text("info-vertexy", str(len(model["vertexy"])))
+    set_text("info-normals", str(len(model["normals_obj"])) +
+             (" ✓ OBJ" if model["ma_obj_normals"] else " (dopočítané)"))
+    set_text("info-plochy",  str(len(model["plochy"])))
+
+    stav_el = document.getElementById("info-stav")
+    if stav_el:
+        if model["nacitany"]:
+            stav_el.textContent = "✓ Načítaný"
+            stav_el.style.color = "#00e5ff"
+        else:
+            stav_el.textContent = "— Čakám"
+            stav_el.style.color = "#666"
 
 
 def zobraz_chybu(sprava: str):
-    """Zobrazí chybovú správu v info paneli."""
-    document.getElementById("info-stav").textContent = "✗ " + sprava
-    document.getElementById("info-stav").style.color = "#ff4444"
+    """Zobrazí chybovú hlášku v info paneli."""
+    el = document.getElementById("info-stav")
+    if el:
+        el.textContent = "✗ " + sprava
+        el.style.color = "#ff4444"
     console.error("[3D Viewer] " + sprava)
 
 
 # ================================================================
-#  EVENT HANDLERY  –  myš a klávesnica
+#  MYŠOVÉ UDALOSTI  –  Blender-like ovládanie
+#
+#  Blender schéma:
+#    MMB drag            = orbit (rotácia okolo target)
+#    Shift + MMB drag    = pan
+#    Koliesko            = zoom
+#    LMB drag            = orbit (fallback pre myši bez MMB)
+#    Shift + LMB drag    = pan   (fallback)
 # ================================================================
 
+def _je_shift(event):
+    """Vráti True ak je Shift stlačený."""
+    return bool(event.shiftKey)
+
+def _zacni_tahanie(event, je_pan):
+    """Spoločná logika pre začiatok ťahania."""
+    mys["posl_x"] = event.clientX
+    mys["posl_y"] = event.clientY
+    if je_pan:
+        mys["tahanie_orbit"] = False
+        mys["tahanie_pan"]   = True
+    else:
+        mys["tahanie_orbit"] = True
+        mys["tahanie_pan"]   = False
+
+
 def on_mousedown(event):
-    """Stlačenie ľavého tlačidla myši → začiatok ťahania."""
-    mys["tahanie"] = True
-    mys["posl_x"]  = event.clientX
-    mys["posl_y"]  = event.clientY
-    event.preventDefault()
+    """
+    button == 0: LMB  → orbit, alebo pan ak je Shift
+    button == 1: MMB  → orbit, alebo pan ak je Shift
+    """
+    btn = event.button
+    if btn == 0 or btn == 1:
+        _zacni_tahanie(event, _je_shift(event))
+        event.preventDefault()
 
 
 def on_mouseup(event):
-    """Uvoľnenie tlačidla myši → koniec ťahania."""
-    mys["tahanie"] = False
+    """Uvoľnenie akéhokoľvek tlačidla ukončí ťahanie."""
+    mys["tahanie_orbit"] = False
+    mys["tahanie_pan"]   = False
 
 
 def on_mousemove(event):
     """
-    Pohyb myšou počas ťahania → rotácia modelu.
-    Rozdiel polohy myši sa prevedie na zmenu rotačných uhlov.
+    Pohyb myšou:
+      - orbit mode: zmení rot_x a rot_y
+      - pan mode:   zmení pan_x a pan_y (posun v pixeloch obrazovky)
     """
-    if not mys["tahanie"]:
-        return
-
     dx = event.clientX - mys["posl_x"]
     dy = event.clientY - mys["posl_y"]
-
-    citlivost = 0.008   # Radiány na pixel
-
-    kamera["rot_y"] += dx * citlivost
-    kamera["rot_x"] += dy * citlivost
-
-    # Obmedzenie vertikálneho uhla (aby sa model „nepreklopil")
-    kamera["rot_x"] = max(-math.pi / 2, min(math.pi / 2, kamera["rot_x"]))
-
     mys["posl_x"] = event.clientX
     mys["posl_y"] = event.clientY
 
-    vykresli()
+    if mys["tahanie_orbit"]:
+        # Citlivosť orbit: 0.007 rad/pixel (podobné Blenderu)
+        kamera["rot_y"] += dx * 0.007
+        # Clamp pitch aby sa model nepreklopil cez pól
+        kamera["rot_x"] = max(-math.pi/2 + 0.01,
+                          min( math.pi/2 - 0.01,
+                               kamera["rot_x"] + dy * 0.007))
+        vykresli()
+
+    elif mys["tahanie_pan"]:
+        # Pan citlivosť závisí od zoomu: pri väčšom zoome pomalší pan
+        citlivost = 1.0 / max(0.1, kamera["zoom"])
+        kamera["pan_x"] += dx * citlivost
+        kamera["pan_y"] += dy * citlivost
+        vykresli()
 
 
 def on_wheel(event):
     """
-    Otočenie kolieska myši → zoom.
-    deltaY > 0 = scroll nadol = oddialenie.
+    Koliesko myši = zoom.
+    Faktor 1.1 / 0.9 per krok (rovnaké ako Blender scroll).
     """
-    delta = event.deltaY
-    faktor = 1.1 if delta > 0 else 0.9
-    kamera["zoom"] = max(0.1, min(10.0, kamera["zoom"] * faktor))
+    faktor = 1.12 if event.deltaY > 0 else 0.88
+    kamera["zoom"] = max(0.05, min(20.0, kamera["zoom"] * faktor))
     vykresli()
     event.preventDefault()
 
 
 def on_keydown(event):
     """
-    Klávesové skratky:
-      R  → reset kamery
-      L  → prepnutie wireframe / solid
+    Klávesové skratky (Blender-like):
+      R        → reset pohľadu
+      L        → wireframe toggle
+      Numpad 1 → predný pohľad
+      Numpad 3 → bočný pohľad
+      Numpad 7 → horný pohľad
     """
-    klaves = event.key.upper()
+    k = event.key
 
-    if klaves == "R":
-        kamera["rot_x"]    = 0.25
-        kamera["rot_y"]    = 0.45
-        kamera["zoom"]     = 1.0
-        vykresli()
+    if k.upper() == "R":
+        reset_pohladu()
 
-    elif klaves == "L":
-        kamera["wireframe"] = not kamera["wireframe"]
-        # Aktualizovať štítok tlačidla
-        btn = document.getElementById("btn-wireframe")
-        if btn:
-            btn.textContent = "■ Solid" if kamera["wireframe"] else "⬡ Wireframe"
-        vykresli()
+    elif k.upper() == "L":
+        prepni_wireframe()
+
+    elif k in ("1","3","7") and not _je_shift(event):
+        # Numpad preset pohľady
+        if k in POHLADOVE_PRESET:
+            rx_p, ry_p, _ = POHLADOVE_PRESET[k]
+            kamera["rot_x"] = rx_p
+            kamera["rot_y"] = ry_p
+            kamera["pan_x"] = 0.0
+            kamera["pan_y"] = 0.0
+            vykresli()
+
+
+def reset_pohladu():
+    """Vráti kameru na predvolenú pozíciu (rovnaké ako Blender Home)."""
+    kamera["rot_x"] = 0.4
+    kamera["rot_y"] = 0.6
+    kamera["zoom"]  = 1.0
+    kamera["pan_x"] = 0.0
+    kamera["pan_y"] = 0.0
+    vykresli()
+
+
+def prepni_wireframe():
+    """Prepne wireframe/solid a aktualizuje UI tlačidlo."""
+    kamera["wireframe"] = not kamera["wireframe"]
+    btn = document.getElementById("btn-wireframe")
+    if btn:
+        if kamera["wireframe"]:
+            btn.textContent  = "■ Solid"
+            btn.dataset.active = "true"
+        else:
+            btn.textContent  = "⬡ Wireframe"
+            btn.dataset.active = "false"
+    vykresli()
 
 
 # ================================================================
 #  DRAG & DROP  a  FILE INPUT
 # ================================================================
 
-def nacitaj_subor_text(obsah: str, nazov: str):
-    """Spracuje textový obsah .obj súboru."""
-    document.getElementById("info-stav").textContent = "⏳ Parsovanie..."
-    document.getElementById("info-stav").style.color = "#ffcc00"
-    parsuj_obj(obsah, nazov)
-
-
 def on_dragover(event):
-    """Povolí drop operáciu (bez toho by prehliadač drag neakceptoval)."""
     event.preventDefault()
     event.dataTransfer.dropEffect = "copy"
 
 
 def on_drop(event):
-    """
-    Spracovanie súboru pretiahnutého na canvas.
-    Overí príponu .obj a načíta obsah súboru.
-    """
+    """Pretiahnutie .obj súboru na canvas."""
     event.preventDefault()
     subory = event.dataTransfer.files
     if subory.length == 0:
         return
-
-    subor = subory.item(0)
-    nazov = subor.name
-
-    # Validácia prípony
-    if not nazov.lower().endswith(".obj"):
-        zobraz_chybu(f"Nepodporovaný formát: '{nazov}'. Nahrај .obj súbor.")
-        return
-
-    # Načítanie súboru cez FileReader (asynchrónne)
-    reader = window.FileReader.new()
-
-    def on_load(evt):
-        obsah = evt.target.result
-        nacitaj_subor_text(obsah, nazov)
-
-    reader.onload = create_proxy(on_load)
-    reader.readAsText(subor)
+    _spracuj_file(subory.item(0))
 
 
 def on_file_input_change(event):
-    """
-    Spracovanie súboru vybraného cez tlačidlo „Vybrať .obj".
-    Rovnaká logika ako drag & drop.
-    """
+    """Výber súboru cez tlačidlo."""
     subory = event.target.files
     if subory.length == 0:
         return
+    _spracuj_file(subory.item(0))
+    # Reset input aby sa dal znova vybrať rovnaký súbor
+    event.target.value = ""
 
-    subor = subory.item(0)
+
+def _spracuj_file(subor):
+    """Spoločná logika pre drop aj file input."""
     nazov = subor.name
-
     if not nazov.lower().endswith(".obj"):
-        zobraz_chybu(f"Nepodporovaný formát: '{nazov}'. Vyber .obj súbor.")
+        zobraz_chybu(f"Len .obj formát! ('{nazov}' odmietnutý)")
         return
 
+    stav_el = document.getElementById("info-stav")
+    if stav_el:
+        stav_el.textContent = "⏳ Parsovanie..."
+        stav_el.style.color = "#ffcc00"
+
     reader = window.FileReader.new()
-
     def on_load(evt):
-        obsah = evt.target.result
-        nacitaj_subor_text(obsah, nazov)
-
+        parsuj_obj(evt.target.result, nazov)
     reader.onload = create_proxy(on_load)
     reader.readAsText(subor)
 
 
 # ================================================================
-#  TLAČIDLO WIREFRAME (HTML)
+#  VÝBER MATERIÁLU / FARBY
 # ================================================================
 
-def on_wireframe_click(event):
-    """Prepne wireframe/solid mód po kliknutí na tlačidlo."""
-    kamera["wireframe"] = not kamera["wireframe"]
-    btn = document.getElementById("btn-wireframe")
-    if btn:
-        btn.textContent = "■ Solid" if kamera["wireframe"] else "⬡ Wireframe"
+def on_material_click(event):
+    """
+    Klik na farebné tlačidlo materiálu.
+    Hodnota farby je uložená v data-rgb atribúte tlačidla
+    vo formáte "r,g,b" (float 0–1).
+    """
+    tlacidlo = event.currentTarget
+    rgb_str  = tlacidlo.dataset.rgb
+    try:
+        r, g, b = (float(x) for x in rgb_str.split(","))
+        kamera["material"] = (r, g, b)
+    except Exception:
+        return
+
+    # Vizuálne označenie aktívneho tlačidla
+    for btn in document.querySelectorAll(".mat-btn"):
+        btn.dataset.active = "false"
+    tlacidlo.dataset.active = "true"
+
     vykresli()
 
 
-def on_reset_click(event):
-    """Resetuje kameru po kliknutí na tlačidlo."""
-    kamera["rot_x"] = 0.25
-    kamera["rot_y"] = 0.45
-    kamera["zoom"]  = 1.0
-    vykresli()
-
-
 # ================================================================
-#  INICIALIZÁCIA  –  spustí sa raz pri načítaní stránky
+#  INICIALIZÁCIA
 # ================================================================
 
 def init():
     """
-    Zaregistruje všetky event listenery a načíta demo model.
-    Táto funkcia je vstupný bod celej Python logiky.
+    Zaregistruje všetky event listenery.
+    Volá sa raz pri načítaní stránky.
     """
     canvas = document.getElementById("canvas3d")
 
-    # Nastaviť veľkosť canvasu podľa jeho CSS veľkosti
-    canvas.width  = canvas.offsetWidth  or 800
-    canvas.height = canvas.offsetHeight or 600
+    # Nastaviť rozlíšenie canvasu podľa jeho CSS veľkosti
+    w = canvas.offsetWidth  or 800
+    h = canvas.offsetHeight or 560
+    canvas.width  = w
+    canvas.height = h
 
-    # ---- Registrácia myšových udalostí ----
-    canvas.addEventListener("mousedown",  create_proxy(on_mousedown))
-    canvas.addEventListener("mouseup",    create_proxy(on_mouseup))
-    canvas.addEventListener("mousemove",  create_proxy(on_mousemove))
-    canvas.addEventListener("wheel",      create_proxy(on_wheel), Object.fromEntries([["passive", False]]))
+    # Predísť context menu pri MMB (stredné tlačidlo)
+    canvas.addEventListener("contextmenu", create_proxy(lambda e: e.preventDefault()))
 
-    # ---- Drag & drop na canvas ----
-    canvas.addEventListener("dragover",   create_proxy(on_dragover))
-    canvas.addEventListener("drop",       create_proxy(on_drop))
+    # Myšové udalosti
+    canvas.addEventListener("mousedown", create_proxy(on_mousedown))
+    document.addEventListener("mouseup",   create_proxy(on_mouseup))
+    document.addEventListener("mousemove", create_proxy(on_mousemove))
+    canvas.addEventListener("wheel",     create_proxy(on_wheel),
+                            Object.fromEntries([["passive", False]]))
 
-    # ---- Klávesnica (globálne) ----
-    document.addEventListener("keydown",  create_proxy(on_keydown))
+    # Drag & drop
+    canvas.addEventListener("dragover", create_proxy(on_dragover))
+    canvas.addEventListener("drop",     create_proxy(on_drop))
 
-    # ---- File input ----
-    file_input = document.getElementById("file-input")
-    if file_input:
-        file_input.addEventListener("change", create_proxy(on_file_input_change))
+    # Klávesnica
+    document.addEventListener("keydown", create_proxy(on_keydown))
 
-    # ---- Tlačidlá ----
-    btn_wire = document.getElementById("btn-wireframe")
-    if btn_wire:
-        btn_wire.addEventListener("click", create_proxy(on_wireframe_click))
+    # File input
+    fi = document.getElementById("file-input")
+    if fi:
+        fi.addEventListener("change", create_proxy(on_file_input_change))
 
-    btn_reset = document.getElementById("btn-reset")
-    if btn_reset:
-        btn_reset.addEventListener("click", create_proxy(on_reset_click))
+    # Tlačidlá toolbar
+    b = document.getElementById("btn-wireframe")
+    if b:
+        b.addEventListener("click", create_proxy(lambda e: prepni_wireframe()))
 
-    # ---- Načítať demo model ----
+    b = document.getElementById("btn-reset")
+    if b:
+        b.addEventListener("click", create_proxy(lambda e: reset_pohladu()))
+
+    # Tlačidlá materiálov
+    for btn in document.querySelectorAll(".mat-btn"):
+        btn.addEventListener("click", create_proxy(on_material_click))
+
+    # Preset pohľady (tlačidlá numpad)
+    for k in ("1","3","7"):
+        el = document.getElementById(f"btn-view-{k}")
+        if el:
+            def make_handler(key):
+                def handler(e):
+                    rx_p, ry_p, _ = POHLADOVE_PRESET[key]
+                    kamera["rot_x"] = rx_p
+                    kamera["rot_y"] = ry_p
+                    kamera["pan_x"] = 0.0
+                    kamera["pan_y"] = 0.0
+                    vykresli()
+                return handler
+            el.addEventListener("click", create_proxy(make_handler(k)))
+
+    # Demo model
     nacitaj_demo()
-    console.log("[3D Viewer] Inicializácia dokončená.")
+    console.log("[3D Viewer v2] Inicializácia OK")
 
 
-# Spustenie inicializácie
 init()
